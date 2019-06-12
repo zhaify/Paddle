@@ -9,6 +9,7 @@ paddle/fluid/operators/distributed/send_recv.proto
 *.DS_Store
 *.vs
 build/
+build2/
 build_doc/
 *.user
 
