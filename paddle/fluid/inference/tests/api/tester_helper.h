@@ -16,12 +16,18 @@
 
 #include <gtest/gtest.h>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <algorithm>
+#include <functional>
 #include <memory>
 #include <string>
 #include <thread>  // NOLINT
 #include <unordered_map>
 #include <vector>
+
 #ifdef WITH_GPERFTOOLS
 #include <gperftools/profiler.h>
 #endif
@@ -58,6 +64,9 @@ DEFINE_bool(zero_copy, false, "Use ZeroCopy to speedup Feed/Fetch.");
 DEFINE_bool(warmup, false,
             "Use warmup to calculate elapsed_time more accurately. "
             "To reduce CI time, it sets false in default.");
+
+DEFINE_string(title, "", "title");
+DEFINE_bool(is_int8, false, "is int8 and vnni");
 
 DECLARE_bool(profile);
 DECLARE_int32(paddle_num_threads);
@@ -316,6 +325,15 @@ void PredictionWarmUp(PaddlePredictor *predictor,
   }
 }
 
+typedef struct {
+  float label;
+  float x1;
+  float y1;
+  float x2;
+  float y2;
+  float difficut;
+} BBOX;
+
 void PredictionRun(PaddlePredictor *predictor,
                    const std::vector<std::vector<PaddleTensor>> &inputs,
                    std::vector<std::vector<PaddleTensor>> *outputs,
@@ -323,50 +341,70 @@ void PredictionRun(PaddlePredictor *predictor,
                    const VarType::Type data_type = VarType::FP32) {
   int num_times = FLAGS_repeat;
   int iterations = inputs.size();  // process the whole dataset ...
-  if (FLAGS_iterations > 0 &&
-      FLAGS_iterations < static_cast<int64_t>(inputs.size()))
-    iterations =
-        FLAGS_iterations;  // ... unless the number of iterations is set
+  LOG(INFO) << iterations << ";" << FLAGS_batch_size;
   outputs->resize(iterations);
   LOG(INFO) << "Thread " << tid << ", number of threads " << num_threads
             << ", run " << num_times << " times...";
   Timer run_timer;
   double elapsed_time = 0;
-#ifdef WITH_GPERFTOOLS
-  ProfilerStart("paddle_inference.prof");
-#endif
-  if (!FLAGS_zero_copy) {
-    run_timer.tic();
-    for (int i = 0; i < iterations; i++) {
-      for (int j = 0; j < num_times; j++) {
-        predictor->Run(inputs[i], &(*outputs)[i], FLAGS_batch_size);
+  run_timer.tic();
+  for (int i = 0; i < iterations; i++) {
+    for (int j = 0; j < num_times; j++) {
+      std::vector<PaddleTensor> output;
+      predictor->Run(inputs[i], &output, FLAGS_batch_size);
+      PaddleTensor bboxes = output[0];
+      float num = static_cast<float>(std::accumulate(
+          bboxes.shape.begin(), bboxes.shape.end(), 1, std::multiplies<int>()));
+      float *b = static_cast<float *>(bboxes.data.data());
+
+      float batch_id = static_cast<float>(i);
+      LOG(INFO) << ">>>>>>>>>>>> num: " << num;
+      float *result = new float[1 + 1 + static_cast<int>(num)];
+      float *tmp = result;
+      memcpy(tmp, &batch_id, sizeof(float));
+      float base = 0.0;
+      tmp += 1;
+      memcpy(tmp, &base, sizeof(float));
+      tmp += 1;
+      // memcpy(result + 2, bboxes.data.data(), static_cast<int>(num));
+      for (int k = 0; k < static_cast<int>(num);) {
+        if (b[k + 1] > 0.2) {
+          *(result + 1) += 1.0;
+          LOG(INFO) << i << ": " << b[k] << ", " << b[k + 1] << ", " << b[k + 2]
+                    << ", " << b[k + 3] << ", " << b[k + 4] << ", " << b[k + 5];
+          memcpy(tmp, b + k, sizeof(float) * 6);
+          tmp += 6;
+        }
+
+        k += 6;
       }
-    }
-    elapsed_time = run_timer.toc();
-  } else {
-    for (int i = 0; i < iterations; i++) {
-      ConvertPaddleTensorToZeroCopyTensor(predictor, inputs[i]);
-      run_timer.tic();
-      for (int j = 0; j < num_times; j++) {
-        predictor->ZeroCopyRun();
-      }
-      elapsed_time += run_timer.toc();
+
+      int sock_fd;
+      sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
+      struct sockaddr_in addr_serv;
+      int len;
+      memset(&addr_serv, 0, sizeof(addr_serv));
+      addr_serv.sin_family = AF_INET;
+      addr_serv.sin_addr.s_addr = inet_addr("127.0.0.1");
+      addr_serv.sin_port = htons(9999);
+      len = sizeof(addr_serv);
+      auto send_num = sendto(sock_fd, result, sizeof(float) * (tmp - result), 0,
+                             (struct sockaddr *)&addr_serv, len);
+      LOG(INFO) << ">>> send " << send_num << ", " << tmp - result;
+      close(sock_fd);
+      delete result;
+      // LOG(INFO) << ">>>>>>>> "<< bboxes.data.length();
+      // float* bbox = static_cast<float *>(bboxes.data.data());
+      // for(int i =0; i < bboxes.data.length() / sizeof(float); i++){
+      //   LOG(INFO) << bbox[i];
+      // }
     }
   }
-#ifdef WITH_GPERFTOOLS
-  ProfilerStop();
-#endif
+  elapsed_time = run_timer.toc();
 
   auto batch_latency = elapsed_time / (iterations * num_times);
   PrintTime(FLAGS_batch_size, num_times, num_threads, tid, batch_latency,
             iterations, data_type);
-  if (FLAGS_record_benchmark) {
-    Benchmark benchmark;
-    benchmark.SetName(FLAGS_model_name);
-    benchmark.SetBatchSize(FLAGS_batch_size);
-    benchmark.SetLatency(batch_latency);
-    benchmark.PersistToFile("benchmark_record.txt");
-  }
 }
 
 void TestOneThreadPrediction(
@@ -506,11 +544,21 @@ void CompareQuantizedAndAnalysis(
   LOG(INFO) << "FP32 & INT8 prediction run: batch_size " << FLAGS_batch_size
             << ", warmup batch size " << FLAGS_warmup_batch_size << ".";
 
-  LOG(INFO) << "--- FP32 prediction start ---";
-  auto *cfg = reinterpret_cast<const PaddlePredictor::Config *>(config);
-  PrintConfig(cfg, true);
-  std::vector<std::vector<PaddleTensor>> analysis_outputs;
-  TestOneThreadPrediction(cfg, inputs, &analysis_outputs, true, VarType::FP32);
+  // if (FLAGS_is_int8){
+  //   LOG(INFO) << "--- INT8 prediction start ---";
+  //   auto *qcfg = reinterpret_cast<const PaddlePredictor::Config *>(qconfig);
+  //   PrintConfig(qcfg, true);
+  //   std::vector<std::vector<PaddleTensor>> quantized_outputs;
+  //   TestOneThreadPrediction(qcfg, inputs, &quantized_outputs, true,
+  //                           VarType::INT8);
+  // }else{
+  //   LOG(INFO) << "--- FP32 prediction start ---";
+  //   auto *cfg = reinterpret_cast<const PaddlePredictor::Config *>(config);
+  //   PrintConfig(cfg, true);
+  //   std::vector<std::vector<PaddleTensor>> analysis_outputs;
+  //   TestOneThreadPrediction(cfg, inputs, &analysis_outputs, true,
+  //   VarType::FP32);
+  // }
 
   LOG(INFO) << "--- INT8 prediction start ---";
   auto *qcfg = reinterpret_cast<const PaddlePredictor::Config *>(qconfig);
@@ -519,8 +567,15 @@ void CompareQuantizedAndAnalysis(
   TestOneThreadPrediction(qcfg, inputs, &quantized_outputs, true,
                           VarType::INT8);
 
-  LOG(INFO) << "--- comparing outputs --- ";
-  CompareTopAccuracy(quantized_outputs, analysis_outputs);
+  // LOG(INFO) << "--- FP32 prediction start ---";
+  // auto *cfg = reinterpret_cast<const PaddlePredictor::Config *>(config);
+  // PrintConfig(cfg, true);
+  // std::vector<std::vector<PaddleTensor>> analysis_outputs;
+  // TestOneThreadPrediction(cfg, inputs, &analysis_outputs, true,
+  // VarType::FP32);
+
+  // LOG(INFO) << "--- comparing outputs --- ";
+  // CompareTopAccuracy(quantized_outputs, analysis_outputs);
 }
 
 void CompareNativeAndAnalysis(

@@ -21,6 +21,8 @@ import tarfile
 import StringIO
 import hashlib
 import tarfile
+import matplotlib.pyplot as plt
+import cv2
 
 DATA_URL = "http://host.robots.ox.ac.uk/pascal/VOC/voc2007/VOCtest_06-Nov-2007.tar"
 DATA_DIR = os.path.expanduser("~/.cache/paddle/dataset/pascalvoc/")
@@ -30,7 +32,7 @@ RESIZE_H = 300
 RESIZE_W = 300
 mean_value = [127.5, 127.5, 127.5]
 ap_version = '11point'
-DATA_OUT = 'pascalvoc_full.bin'
+DATA_OUT = 'pascalvoc_origion_full.bin'
 DATA_OUT_PATH = os.path.join(DATA_DIR, DATA_OUT)
 BIN_TARGETHASH = "f6546cadc42f5ff13178b84ed29b740b"
 TAR_TARGETHASH = "b6e924de25625d8de591ea690078ad9f"
@@ -43,17 +45,7 @@ def preprocess(img):
 
     img = img.resize((RESIZE_W, RESIZE_H), Image.ANTIALIAS)
     img = np.array(img)
-
-    # HWC to CHW
-    if len(img.shape) == 3:
-        img = np.swapaxes(img, 1, 2)
-        img = np.swapaxes(img, 1, 0)
-    # RBG to BGR
-    img = img[[2, 1, 0], :, :]
-    img = img.astype('float32')
-    img_mean = np.array(mean_value)[:, np.newaxis, np.newaxis].astype('float32')
-    img -= img_mean
-    img = img * 0.007843
+    print(img.shape)
     return img
 
 
@@ -104,6 +96,7 @@ def convert_pascalvoc(tar_path, data_out_path):
                 gt_labels[name_prefix] = tar.extractfile(tarInfo).read()
 
     for line_idx, name_prefix in enumerate(lines):
+
         im = Image.open(StringIO.StringIO(images[name_prefix]))
         if im.mode == 'L':
             im = im.convert('RGB')
@@ -131,6 +124,12 @@ def convert_pascalvoc(tar_path, data_out_path):
             bbox_sample.append(float(bbox.find('ymin').text) / im_height)
             bbox_sample.append(float(bbox.find('xmax').text) / im_width)
             bbox_sample.append(float(bbox.find('ymax').text) / im_height)
+
+            x1 = float(bbox.find('xmin').text) / im_width
+            y1 = float(bbox.find('ymin').text) / im_height
+            x2 = float(bbox.find('xmax').text) / im_width
+            y2 = float(bbox.find('ymax').text) / im_height
+
             bbox_sample.append(difficult)
             bbox_labels.append(bbox_sample)
 
@@ -168,18 +167,8 @@ def download_pascalvoc(data_url, data_dir, tar_targethash, tar_path):
 def run_convert():
     try_limit = 2
     retry = 0
-    while not (os.path.exists(DATA_OUT_PATH) and
-               os.path.getsize(DATA_OUT_PATH) == BIN_FULLSIZE and BIN_TARGETHASH
-               == hashlib.md5(open(DATA_OUT_PATH, 'rb').read()).hexdigest()):
-        if os.path.exists(DATA_OUT_PATH):
-            sys.stderr.write(
-                "The existing binary file is broken. It is being removed...\n")
-            os.remove(DATA_OUT_PATH)
-        if retry < try_limit:
-            retry = retry + 1
-        else:
-            download_pascalvoc(DATA_URL, DATA_DIR, TAR_TARGETHASH, TAR_PATH)
-            convert_pascalvoc(TAR_PATH, DATA_OUT_PATH)
+    #download_pascalvoc(DATA_URL, DATA_DIR, TAR_TARGETHASH, TAR_PATH)
+    convert_pascalvoc(TAR_PATH, DATA_OUT_PATH)
     print("Success! \nThe binary file can be found at %s\n" % DATA_OUT_PATH)
 
 
