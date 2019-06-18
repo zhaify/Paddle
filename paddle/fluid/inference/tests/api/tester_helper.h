@@ -14,9 +14,8 @@
 
 #pragma once
 
-#include <gtest/gtest.h>
-
 #include <arpa/inet.h>
+#include <gtest/gtest.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -31,6 +30,8 @@
 #ifdef WITH_GPERFTOOLS
 #include <gperftools/profiler.h>
 #endif
+#include <highgui.hpp>
+#include <opencv.hpp>
 #include "paddle/fluid/framework/ir/fuse_pass_base.h"
 #include "paddle/fluid/framework/scope.h"
 #include "paddle/fluid/inference/analysis/analyzer.h"
@@ -67,6 +68,9 @@ DEFINE_bool(warmup, false,
 
 DEFINE_string(title, "", "title");
 DEFINE_bool(is_int8, false, "is int8 and vnni");
+DEFINE_string(image_data_path, "", "image_path");
+DEFINE_double(render_confidence, 0.2, "render confidence");
+DEFINE_string(images_list_path, "", "images list path");
 
 DECLARE_bool(profile);
 DECLARE_int32(paddle_num_threads);
@@ -75,6 +79,17 @@ namespace paddle {
 namespace inference {
 
 using paddle::framework::proto::VarType;
+
+std::vector<std::string> read_labels(std::string path) {
+  std::vector<std::string> result;
+  std::ifstream labels(path);
+  std::string tmp;
+  while (std::getline(labels, tmp)) {
+    result.push_back(tmp);
+  }
+
+  return result;
+}
 
 template <typename T>
 constexpr paddle::PaddleDType GetPaddleDType();
@@ -325,86 +340,111 @@ void PredictionWarmUp(PaddlePredictor *predictor,
   }
 }
 
-typedef struct {
-  float label;
-  float x1;
-  float y1;
-  float x2;
-  float y2;
-  float difficut;
-} BBOX;
-
 void PredictionRun(PaddlePredictor *predictor,
                    const std::vector<std::vector<PaddleTensor>> &inputs,
                    std::vector<std::vector<PaddleTensor>> *outputs,
                    int num_threads, int tid,
                    const VarType::Type data_type = VarType::FP32) {
   int num_times = FLAGS_repeat;
-  int iterations = inputs.size();  // process the whole dataset ...
+  int iterations = inputs.size();
   LOG(INFO) << iterations << ";" << FLAGS_batch_size;
-  outputs->resize(iterations);
   LOG(INFO) << "Thread " << tid << ", number of threads " << num_threads
             << ", run " << num_times << " times...";
-  Timer run_timer;
-  double elapsed_time = 0;
-  run_timer.tic();
-  for (int i = 0; i < iterations; i++) {
-    for (int j = 0; j < num_times; j++) {
-      std::vector<PaddleTensor> output;
-      predictor->Run(inputs[i], &output, FLAGS_batch_size);
-      PaddleTensor bboxes = output[0];
-      float num = static_cast<float>(std::accumulate(
-          bboxes.shape.begin(), bboxes.shape.end(), 1, std::multiplies<int>()));
-      float *b = static_cast<float *>(bboxes.data.data());
 
-      float batch_id = static_cast<float>(i);
-      LOG(INFO) << ">>>>>>>>>>>> num: " << num;
-      float *result = new float[1 + 1 + static_cast<int>(num)];
-      float *tmp = result;
-      memcpy(tmp, &batch_id, sizeof(float));
-      float base = 0.0;
-      tmp += 1;
-      memcpy(tmp, &base, sizeof(float));
-      tmp += 1;
-      // memcpy(result + 2, bboxes.data.data(), static_cast<int>(num));
-      for (int k = 0; k < static_cast<int>(num);) {
-        if (b[k + 1] > 0.2) {
-          *(result + 1) += 1.0;
-          LOG(INFO) << i << ": " << b[k] << ", " << b[k + 1] << ", " << b[k + 2]
-                    << ", " << b[k + 3] << ", " << b[k + 4] << ", " << b[k + 5];
-          memcpy(tmp, b + k, sizeof(float) * 6);
-          tmp += 6;
-        }
+  std::vector<std::string> images_list = read_labels(FLAGS_images_list_path);
+  cv::namedWindow(FLAGS_title, CV_WINDOW_NORMAL);
 
-        k += 6;
+  std::vector<std::string> text_labels{
+      "background", "aeroplane",   "bicycle", "bird",  "boat",
+      "bottle",     "bus",         "car",     "cat",   "chair",
+      "cow",        "diningtable", "dog",     "horse", "motorbike",
+      "person",     "pottedplant", "sheep",   "sofa",  "train",
+      "tvmonitor"};
+
+  std::vector<cv::Scalar> colors;
+  for (int i = 0; i < 255;) {
+    for (int j = 0; j < 255;) {
+      for (int k = 0; k < 255;) {
+        colors.push_back(cv::Scalar(i, j, k));
+        k += 80;
       }
-
-      int sock_fd;
-      sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
-      struct sockaddr_in addr_serv;
-      int len;
-      memset(&addr_serv, 0, sizeof(addr_serv));
-      addr_serv.sin_family = AF_INET;
-      addr_serv.sin_addr.s_addr = inet_addr("127.0.0.1");
-      addr_serv.sin_port = htons(9999);
-      len = sizeof(addr_serv);
-      auto send_num = sendto(sock_fd, result, sizeof(float) * (tmp - result), 0,
-                             (struct sockaddr *)&addr_serv, len);
-      LOG(INFO) << ">>> send " << send_num << ", " << tmp - result;
-      close(sock_fd);
-      delete result;
-      // LOG(INFO) << ">>>>>>>> "<< bboxes.data.length();
-      // float* bbox = static_cast<float *>(bboxes.data.data());
-      // for(int i =0; i < bboxes.data.length() / sizeof(float); i++){
-      //   LOG(INFO) << bbox[i];
-      // }
+      j += 80;
     }
+    i += 80;
   }
-  elapsed_time = run_timer.toc();
 
-  auto batch_latency = elapsed_time / (iterations * num_times);
-  PrintTime(FLAGS_batch_size, num_times, num_threads, tid, batch_latency,
-            iterations, data_type);
+  int TEXT_BACKGROUND_H = 20.0;
+
+  for (int i = 0; i < iterations; i++) {
+    LOG(INFO) << "reading image batch id " << i;
+    std::string image_name = images_list[i];
+    LOG(INFO) << "reading image name " << image_name;
+    std::string image_path = FLAGS_image_data_path + std::string("/") +
+                             image_name + std::string(".jpg");
+    LOG(INFO) << "reading image " << image_path;
+    cv::Mat img = cv::imread(image_path, 1);
+    LOG(INFO) << img.channels() << ", " << img.rows << ", " << img.cols;
+    cv::Mat img2;
+    cv::resize(img, img2, cv::Size(img.cols * 2, img.rows * 2), 0, 0,
+               cv::INTER_AREA);
+    LOG(INFO) << img2.channels() << ", " << img2.rows << ", " << img2.cols;
+
+    std::vector<PaddleTensor> output;
+
+    Timer run_timer;
+    run_timer.tic();
+    predictor->Run(inputs[i], &output, FLAGS_batch_size);
+    double elapsed_time = run_timer.toc();
+    LOG(INFO) << "====== sample latency: " << elapsed_time
+              << "ms, fps: " << 1000.f / elapsed_time;
+
+    PaddleTensor bboxes = output[0];
+    PaddleTensor top1 = output[1];
+    PaddleTensor top5 = output[2];
+
+    float num = static_cast<float>(std::accumulate(
+        bboxes.shape.begin(), bboxes.shape.end(), 1, std::multiplies<int>()));
+    LOG(INFO) << "num of prediction " << num;
+    float *bbs = static_cast<float *>(bboxes.data.data());
+
+    for (int k = 0; k < static_cast<int>(num);) {
+      int label_index = static_cast<int>(bbs[k++]);
+      if (label_index == 0) {
+        continue;
+      }
+      std::string text_label = text_labels[label_index];
+      float confidence = bbs[k++];
+      float x1 = std::min(std::max(bbs[k++], 0.0f), 1.0f) * img2.cols;
+      float y1 = std::min(std::max(bbs[k++], 0.0f), 1.0f) * img2.rows;
+      float x2 = std::min(std::max(bbs[k++], 0.0f), 1.0f) * img2.cols;
+      float y2 = std::min(std::max(bbs[k++], 0.0f), 1.0f) * img2.rows;
+      if (confidence > FLAGS_render_confidence) {
+        LOG(INFO) << "rendering bbox (" << x1 << ", " << y1 << "), (" << x2
+                  << ", " << y2 << ")";
+
+        cv::rectangle(img2, cv::Point(x1, y1), cv::Point(x2, y2),
+                      colors[label_index], 2);
+
+        if ((y1 - TEXT_BACKGROUND_H) < 0.0) {
+          cv::rectangle(img2, cv::Point(x1 - 1, y1),
+                        cv::Point(x2, y1 + TEXT_BACKGROUND_H),
+                        colors[label_index], -1);
+        } else {
+          cv::rectangle(img2, cv::Point(x1 - 1, y1 - TEXT_BACKGROUND_H),
+                        cv::Point(x2, y1), colors[label_index], -1);
+        }
+        int baseline = 0;
+        cv::Size text_size = cv::getTextSize(
+            text_label, cv::FONT_HERSHEY_SIMPLEX, 0.75, 2, &baseline);
+        LOG(INFO) << cv::putText(img2, text_label, cv::Point(x1, y1),
+                                 cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                                 cv::Scalar(0, 0, 0), 0.5);
+      }
+    }
+
+    cv::imshow(FLAGS_title, img2);
+    cv::waitKey(0);
+  }
 }
 
 void TestOneThreadPrediction(
@@ -544,38 +584,21 @@ void CompareQuantizedAndAnalysis(
   LOG(INFO) << "FP32 & INT8 prediction run: batch_size " << FLAGS_batch_size
             << ", warmup batch size " << FLAGS_warmup_batch_size << ".";
 
-  // if (FLAGS_is_int8){
-  //   LOG(INFO) << "--- INT8 prediction start ---";
-  //   auto *qcfg = reinterpret_cast<const PaddlePredictor::Config *>(qconfig);
-  //   PrintConfig(qcfg, true);
-  //   std::vector<std::vector<PaddleTensor>> quantized_outputs;
-  //   TestOneThreadPrediction(qcfg, inputs, &quantized_outputs, true,
-  //                           VarType::INT8);
-  // }else{
-  //   LOG(INFO) << "--- FP32 prediction start ---";
-  //   auto *cfg = reinterpret_cast<const PaddlePredictor::Config *>(config);
-  //   PrintConfig(cfg, true);
-  //   std::vector<std::vector<PaddleTensor>> analysis_outputs;
-  //   TestOneThreadPrediction(cfg, inputs, &analysis_outputs, true,
-  //   VarType::FP32);
-  // }
-
-  LOG(INFO) << "--- INT8 prediction start ---";
-  auto *qcfg = reinterpret_cast<const PaddlePredictor::Config *>(qconfig);
-  PrintConfig(qcfg, true);
-  std::vector<std::vector<PaddleTensor>> quantized_outputs;
-  TestOneThreadPrediction(qcfg, inputs, &quantized_outputs, true,
-                          VarType::INT8);
-
-  // LOG(INFO) << "--- FP32 prediction start ---";
-  // auto *cfg = reinterpret_cast<const PaddlePredictor::Config *>(config);
-  // PrintConfig(cfg, true);
-  // std::vector<std::vector<PaddleTensor>> analysis_outputs;
-  // TestOneThreadPrediction(cfg, inputs, &analysis_outputs, true,
-  // VarType::FP32);
-
-  // LOG(INFO) << "--- comparing outputs --- ";
-  // CompareTopAccuracy(quantized_outputs, analysis_outputs);
+  if (FLAGS_is_int8) {
+    LOG(INFO) << "--- INT8 prediction start ---";
+    auto *qcfg = reinterpret_cast<const PaddlePredictor::Config *>(qconfig);
+    PrintConfig(qcfg, true);
+    std::vector<std::vector<PaddleTensor>> quantized_outputs;
+    TestOneThreadPrediction(qcfg, inputs, &quantized_outputs, true,
+                            VarType::INT8);
+  } else {
+    LOG(INFO) << "--- FP32 prediction start ---";
+    auto *cfg = reinterpret_cast<const PaddlePredictor::Config *>(config);
+    PrintConfig(cfg, true);
+    std::vector<std::vector<PaddleTensor>> analysis_outputs;
+    TestOneThreadPrediction(cfg, inputs, &analysis_outputs, true,
+                            VarType::FP32);
+  }
 }
 
 void CompareNativeAndAnalysis(
