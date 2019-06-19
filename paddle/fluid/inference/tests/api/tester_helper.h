@@ -57,8 +57,7 @@ DEFINE_bool(test_all_data, false, "Test the all dataset in data file.");
 DEFINE_int32(num_threads, 1, "Running the inference program in multi-threads.");
 DEFINE_bool(use_analysis, true,
             "Running the inference program in analysis mode.");
-DEFINE_bool(record_benchmark, false,
-            "Record benchmark after profiling the model");
+
 DEFINE_double(accuracy, 1e-3, "Result Accuracy.");
 DEFINE_double(quantized_accuracy, 1e-2, "Result Quantized Accuracy.");
 DEFINE_bool(zero_copy, false, "Use ZeroCopy to speedup Feed/Fetch.");
@@ -71,6 +70,7 @@ DEFINE_bool(is_int8, false, "is int8 and vnni");
 DEFINE_string(image_data_path, "", "image_path");
 DEFINE_double(render_confidence, 0.2, "render confidence");
 DEFINE_string(images_list_path, "", "images list path");
+DEFINE_bool(draw_gt, false, "draw ground truth bounding box");
 
 DECLARE_bool(profile);
 DECLARE_int32(paddle_num_threads);
@@ -114,92 +114,6 @@ void PrintConfig(const PaddlePredictor::Config *config, bool use_analysis) {
   LOG(INFO) << analysis_config->ToNativeConfig();
 }
 
-// Compare result between two PaddleTensor
-void CompareResult(const std::vector<PaddleTensor> &outputs,
-                   const std::vector<PaddleTensor> &ref_outputs) {
-  EXPECT_GT(outputs.size(), 0UL);
-  EXPECT_EQ(outputs.size(), ref_outputs.size());
-  for (size_t i = 0; i < outputs.size(); i++) {
-    auto &out = outputs[i];
-    auto &ref_out = ref_outputs[i];
-    size_t size = VecReduceToInt(out.shape);
-    size_t ref_size = VecReduceToInt(ref_out.shape);
-    EXPECT_GT(size, 0UL);
-    EXPECT_EQ(size, ref_size);
-    EXPECT_EQ(out.dtype, ref_out.dtype);
-    switch (out.dtype) {
-      case PaddleDType::INT64: {
-        int64_t *pdata = static_cast<int64_t *>(out.data.data());
-        int64_t *pdata_ref = static_cast<int64_t *>(ref_out.data.data());
-        for (size_t j = 0; j < size; ++j) {
-          EXPECT_EQ(pdata_ref[j], pdata[j]);
-        }
-        break;
-      }
-      case PaddleDType::FLOAT32: {
-        float *pdata = static_cast<float *>(out.data.data());
-        float *pdata_ref = static_cast<float *>(ref_out.data.data());
-        for (size_t j = 0; j < size; ++j) {
-          CHECK_LE(std::abs(pdata_ref[j] - pdata[j]), FLAGS_accuracy);
-        }
-        break;
-      }
-      case PaddleDType::INT32: {
-        int32_t *pdata = static_cast<int32_t *>(out.data.data());
-        int32_t *pdata_ref = static_cast<int32_t *>(ref_out.data.data());
-        for (size_t j = 0; j < size; ++j) {
-          EXPECT_EQ(pdata_ref[j], pdata[j]);
-        }
-        break;
-      }
-    }
-  }
-}
-
-// Compare result between a PaddleTensor and a ZeroCopyTensor
-void CompareResult(const std::vector<PaddleTensor> &outputs,
-                   const std::vector<ZeroCopyTensor> &ref_outputs) {
-  EXPECT_GT(outputs.size(), 0UL);
-  EXPECT_EQ(outputs.size(), ref_outputs.size());
-  for (size_t i = 0; i < outputs.size(); i++) {
-    auto &out = outputs[i];
-    auto &ref_out = ref_outputs[i];
-    size_t size = VecReduceToInt(out.shape);
-    EXPECT_GT(size, 0UL);
-    int ref_size = 0;  // this is the number of elements not memory size
-    PaddlePlace place;
-    switch (out.dtype) {
-      case PaddleDType::INT64: {
-        int64_t *pdata = static_cast<int64_t *>(out.data.data());
-        int64_t *pdata_ref = ref_out.data<int64_t>(&place, &ref_size);
-        EXPECT_EQ(size, static_cast<size_t>(ref_size));
-        for (size_t j = 0; j < size; ++j) {
-          EXPECT_EQ(pdata_ref[j], pdata[j]);
-        }
-        break;
-      }
-      case PaddleDType::FLOAT32: {
-        float *pdata = static_cast<float *>(out.data.data());
-        float *pdata_ref = ref_out.data<float>(&place, &ref_size);
-        EXPECT_EQ(size, ref_size);
-        for (size_t j = 0; j < size; ++j) {
-          CHECK_LE(std::abs(pdata_ref[j] - pdata[j]), FLAGS_accuracy);
-        }
-        break;
-      }
-      case PaddleDType::INT32: {
-        int32_t *pdata = static_cast<int32_t *>(out.data.data());
-        int32_t *pdata_ref = ref_out.data<int32_t>(&place, &ref_size);
-        EXPECT_EQ(size, ref_size);
-        for (size_t j = 0; j < size; ++j) {
-          EXPECT_EQ(pdata_ref[j], pdata[j]);
-        }
-        break;
-      }
-    }
-  }
-}
-
 std::unique_ptr<PaddlePredictor> CreateTestPredictor(
     const PaddlePredictor::Config *config, bool use_analysis = true) {
   const auto *analysis_config =
@@ -211,111 +125,6 @@ std::unique_ptr<PaddlePredictor> CreateTestPredictor(
   return CreatePaddlePredictor<NativeConfig>(native_config);
 }
 
-size_t GetSize(const PaddleTensor &out) { return VecReduceToInt(out.shape); }
-
-std::unordered_map<std::string, int> GetFuseStatis(PaddlePredictor *predictor,
-                                                   int *num_ops) {
-  std::unordered_map<std::string, int> res;
-  auto *analysis_predictor = static_cast<AnalysisPredictor *>(predictor);
-  auto *fusion_status =
-      analysis_predictor->analysis_argument().fusion_statis_ptr();
-  if (!fusion_status) {
-    return res;
-  }
-  for (auto &item : *fusion_status) {
-    LOG(INFO) << "fused " << item.first << " " << item.second;
-  }
-  int num = 0;
-  for (auto &node :
-       analysis_predictor->analysis_argument().main_graph().Nodes()) {
-    if (node->IsOp()) {
-      ++num;
-    }
-  }
-  *num_ops = num;
-  return *fusion_status;
-}
-
-void SetFakeImageInput(std::vector<std::vector<PaddleTensor>> *inputs,
-                       const std::string &dirname, bool is_combined = true,
-                       std::string model_filename = "model",
-                       std::string params_filename = "params",
-                       const std::vector<std::string> *feed_names = nullptr,
-                       const int continuous_inuput_index = 0) {
-  // Set fake_image_data
-  PADDLE_ENFORCE_EQ(FLAGS_test_all_data, 0, "Only have single batch of data.");
-  std::vector<std::vector<int64_t>> feed_target_shapes = GetFeedTargetShapes(
-      dirname, is_combined, model_filename, params_filename);
-  std::ostringstream os;
-  for (size_t i = 0; i < feed_target_shapes.size(); ++i) {
-    os << "feed target " << i << ": {" << feed_target_shapes[i][0];
-    for (size_t j = 1; j < feed_target_shapes[i].size(); ++j) {
-      os << ", " << feed_target_shapes[i][j];
-    }
-    os << "}\n";
-  }
-  LOG(INFO) << os.str();
-  if (feed_names) {
-    PADDLE_ENFORCE_EQ(feed_names->size(), feed_target_shapes.size());
-  }
-  std::vector<PaddleTensor> input_slots(feed_target_shapes.size());
-  for (size_t i = 0; i < feed_target_shapes.size(); ++i) {
-    const auto &feed_shape = feed_target_shapes[i];
-    auto &input = input_slots[i];
-    std::vector<int> shape({FLAGS_batch_size});
-    for (size_t s = 1; s < feed_shape.size(); ++s) {
-      shape.push_back(static_cast<int>(feed_shape[s]));
-    }
-    if (feed_names) {
-      input.name = (*feed_names)[i];
-    }
-    input.shape = shape;
-    input.dtype = PaddleDType::FLOAT32;
-    size_t len = std::accumulate(shape.begin(), shape.end(), size_t{1},
-                                 [](int a, int b) { return a * b; });
-    input.data.Resize(len * sizeof(float));
-    input.lod.assign({{0, static_cast<size_t>(FLAGS_batch_size)}});
-    float *input_data = static_cast<float *>(input.data.data());
-    // fill input data, for profile easily, do not use random data here.
-    for (size_t j = 0; j < len; ++j) {
-      *(input_data + j) =
-          static_cast<float>((j + continuous_inuput_index) % len) / len;
-    }
-  }
-  (*inputs).emplace_back(input_slots);
-}
-
-void GetInputPerBatch(const std::vector<std::vector<int64_t>> &in,
-                      std::vector<std::vector<int64_t>> *out,
-                      std::vector<size_t> *lod, size_t batch_iter,
-                      size_t batch_end) {
-  lod->clear();
-  lod->push_back(0);
-  for (auto it = in.begin() + batch_iter; it < in.begin() + batch_end; it++) {
-    out->push_back(*it);
-    lod->push_back(lod->back() + (*it).size());  // calculate lod
-  }
-}
-
-void ConvertPaddleTensorToZeroCopyTensor(
-    PaddlePredictor *predictor, const std::vector<PaddleTensor> &inputs) {
-  for (size_t i = 0; i < inputs.size(); i++) {
-    auto input = inputs[i];
-    auto tensor = predictor->GetInputTensor(input.name);
-    tensor->Reshape(input.shape);
-    tensor->SetLoD({input.lod});
-    if (input.dtype == PaddleDType::INT64) {
-      ZeroCopyTensorAssignData<int64_t>(tensor.get(), input.data);
-    } else if (input.dtype == PaddleDType::FLOAT32) {
-      ZeroCopyTensorAssignData<float>(tensor.get(), input.data);
-    } else if (input.dtype == PaddleDType::INT32) {
-      ZeroCopyTensorAssignData<int32_t>(tensor.get(), input.data);
-    } else {
-      LOG(ERROR) << "unsupported feed type " << input.dtype;
-    }
-  }
-}
-
 void PredictionWarmUp(PaddlePredictor *predictor,
                       const std::vector<std::vector<PaddleTensor>> &inputs,
                       std::vector<std::vector<PaddleTensor>> *outputs,
@@ -323,9 +132,6 @@ void PredictionWarmUp(PaddlePredictor *predictor,
                       const VarType::Type data_type = VarType::FP32) {
   int batch_size = FLAGS_batch_size;
   LOG(INFO) << "Running thread " << tid << ", warm up run...";
-  if (FLAGS_zero_copy) {
-    ConvertPaddleTensorToZeroCopyTensor(predictor, inputs[0]);
-  }
   outputs->resize(1);
   Timer warmup_timer;
   warmup_timer.tic();
@@ -366,15 +172,16 @@ void PredictionRun(PaddlePredictor *predictor,
     for (int j = 0; j < 255;) {
       for (int k = 0; k < 255;) {
         colors.push_back(cv::Scalar(i, j, k));
-        k += 80;
+        k += 70;
       }
-      j += 80;
+      j += 70;
     }
-    i += 80;
+    i += 70;
   }
 
-  int TEXT_BACKGROUND_H = 20.0;
+  cv::Scalar gt_color = cv::Scalar(255, 255, 255);
 
+  int TEXT_BACKGROUND_H = 20.0;
   for (int i = 0; i < iterations; i++) {
     LOG(INFO) << "reading image batch id " << i;
     std::string image_name = images_list[i];
@@ -385,8 +192,9 @@ void PredictionRun(PaddlePredictor *predictor,
     cv::Mat img = cv::imread(image_path, 1);
     LOG(INFO) << img.channels() << ", " << img.rows << ", " << img.cols;
     cv::Mat img2;
-    cv::resize(img, img2, cv::Size(img.cols * 2, img.rows * 2), 0, 0,
-               cv::INTER_AREA);
+    cv::resize(img, img2, cv::Size(static_cast<int>(img.cols * 3),
+                                   static_cast<int>(img.rows * 3)),
+               0, 0, cv::INTER_AREA);
     LOG(INFO) << img2.channels() << ", " << img2.rows << ", " << img2.cols;
 
     std::vector<PaddleTensor> output;
@@ -395,8 +203,6 @@ void PredictionRun(PaddlePredictor *predictor,
     run_timer.tic();
     predictor->Run(inputs[i], &output, FLAGS_batch_size);
     double elapsed_time = run_timer.toc();
-    LOG(INFO) << "====== sample latency: " << elapsed_time
-              << "ms, fps: " << 1000.f / elapsed_time;
 
     PaddleTensor bboxes = output[0];
     PaddleTensor top1 = output[1];
@@ -407,6 +213,7 @@ void PredictionRun(PaddlePredictor *predictor,
     LOG(INFO) << "num of prediction " << num;
     float *bbs = static_cast<float *>(bboxes.data.data());
 
+    // draw predict bbox
     for (int k = 0; k < static_cast<int>(num);) {
       int label_index = static_cast<int>(bbs[k++]);
       if (label_index == 0) {
@@ -414,32 +221,110 @@ void PredictionRun(PaddlePredictor *predictor,
       }
       std::string text_label = text_labels[label_index];
       float confidence = bbs[k++];
-      float x1 = std::min(std::max(bbs[k++], 0.0f), 1.0f) * img2.cols;
-      float y1 = std::min(std::max(bbs[k++], 0.0f), 1.0f) * img2.rows;
-      float x2 = std::min(std::max(bbs[k++], 0.0f), 1.0f) * img2.cols;
-      float y2 = std::min(std::max(bbs[k++], 0.0f), 1.0f) * img2.rows;
+      float x1 = std::min(std::max(bbs[k++], 0.0f), 0.993f) * img2.cols;
+      float y1 = std::min(std::max(bbs[k++], 0.0f), 0.993f) * img2.rows;
+      float x2 = std::min(std::max(bbs[k++], 0.0f), 0.993f) * img2.cols;
+      float y2 = std::min(std::max(bbs[k++], 0.0f), 0.993f) * img2.rows;
       if (confidence > FLAGS_render_confidence) {
-        LOG(INFO) << "rendering bbox (" << x1 << ", " << y1 << "), (" << x2
-                  << ", " << y2 << ")";
+        LOG(INFO) << "rendering predict bbox (" << x1 << ", " << y1 << "), ("
+                  << x2 << ", " << y2 << ")";
 
         cv::rectangle(img2, cv::Point(x1, y1), cv::Point(x2, y2),
                       colors[label_index], 2);
 
-        if ((y1 - TEXT_BACKGROUND_H) < 0.0) {
-          cv::rectangle(img2, cv::Point(x1 - 1, y1),
-                        cv::Point(x2, y1 + TEXT_BACKGROUND_H),
-                        colors[label_index], -1);
-        } else {
-          cv::rectangle(img2, cv::Point(x1 - 1, y1 - TEXT_BACKGROUND_H),
-                        cv::Point(x2, y1), colors[label_index], -1);
-        }
         int baseline = 0;
         cv::Size text_size = cv::getTextSize(
-            text_label, cv::FONT_HERSHEY_SIMPLEX, 0.75, 2, &baseline);
-        LOG(INFO) << cv::putText(img2, text_label, cv::Point(x1, y1),
-                                 cv::FONT_HERSHEY_SIMPLEX, 0.5,
-                                 cv::Scalar(0, 0, 0), 0.5);
+            text_label, cv::FONT_HERSHEY_SIMPLEX, 0.5, 0.5, &baseline);
+
+        if ((y1 - TEXT_BACKGROUND_H) < 0.0) {
+          cv::rectangle(
+              img2, cv::Point(x1 - 1, y1),
+              cv::Point(x1 + text_size.width + 1, y1 + TEXT_BACKGROUND_H),
+              colors[label_index], -1);
+
+          cv::putText(
+              img2, text_label,
+              cv::Point(x1, y1 + TEXT_BACKGROUND_H / 2 + text_size.height / 2),
+              cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 0.5);
+        } else {
+          cv::rectangle(img2, cv::Point(x1 - 1, y1 - TEXT_BACKGROUND_H),
+                        cv::Point(x1 + text_size.width + 1, y1),
+                        colors[label_index], -1);
+
+          cv::putText(img2, text_label,
+                      cv::Point(x1, y1 - (TEXT_BACKGROUND_H / 2 -
+                                          text_size.height / 2)),
+                      cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 0.5);
+        }
       }
+    }
+
+    // draw gt bbox
+    if (FLAGS_draw_gt) {
+      PaddleTensor gt_labels = inputs[i][2];
+      float num = static_cast<float>(std::accumulate(gt_labels.shape.begin(),
+                                                     gt_labels.shape.end(), 1,
+                                                     std::multiplies<int>()));
+      PaddleTensor gt_bboxes = inputs[i][1];
+      int l = 0;
+      float *gt_bbs = static_cast<float *>(gt_bboxes.data.data());
+      for (int k = 0; i < static_cast<int>(num); k++) {
+        float x1 = std::min(std::max(gt_bbs[k++], 0.0f), 0.993f) * img2.cols;
+        float y1 = std::min(std::max(gt_bbs[k++], 0.0f), 0.993f) * img2.rows;
+        float x2 = std::min(std::max(gt_bbs[k++], 0.0f), 0.993f) * img2.cols;
+        float y2 = std::min(std::max(gt_bbs[k++], 0.0f), 0.993f) * img2.rows;
+        LOG(INFO) << "rendering ground truth bbox (" << x1 << ", " << y1
+                  << "), (" << x2 << ", " << y2 << ")";
+
+        int label_index =
+            static_cast<int>(static_cast<float *>(gt_labels.data.data())[l]);
+        cv::rectangle(img2, cv::Point(x1, y1), cv::Point(x2, y2), gt_color, 2);
+        l += 1;
+      }
+    }
+
+    // draw msg
+    std::vector<std::string> msg;
+    std::string mAP = "Current mAP: " +
+                      std::to_string(*static_cast<float *>(top1.data.data()));
+    msg.push_back(mAP);
+
+    std::string avg_mAP =
+        "Average mAP: " +
+        std::to_string(*static_cast<float *>(top5.data.data()));
+    msg.push_back(avg_mAP);
+
+    std::string num_cores =
+        "    Threads: " + std::to_string(FLAGS_paddle_num_threads);
+    msg.push_back(num_cores);
+
+    std::string vnni = "INT8 & VNNI: " + std::to_string(FLAGS_is_int8);
+    msg.push_back(vnni);
+
+    std::string fps = "        FPS: " + std::to_string(1000.f / elapsed_time);
+    msg.push_back(fps);
+
+    std::string latency = "    Latency: " + std::to_string(elapsed_time);
+    msg.push_back(latency);
+
+    std::string render_confidence =
+        " Confidence: " + std::to_string(FLAGS_render_confidence);
+    msg.push_back(render_confidence);
+
+    for (int i = 0; i < msg.size(); i++) {
+      LOG(INFO) << msg[i];
+    }
+
+    for (int i = 0; i < msg.size(); i++) {
+      int baseline = 0;
+      cv::Size text_size = cv::getTextSize(msg[i], cv::FONT_HERSHEY_SIMPLEX,
+                                           0.5, 0.5, &baseline);
+
+      cv::putText(img2, msg[i],
+                  cv::Point(1.0, TEXT_BACKGROUND_H * i + TEXT_BACKGROUND_H / 2 +
+                                     text_size.height / 2),
+                  cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255, 155),
+                  0.5);
     }
 
     cv::imshow(FLAGS_title, img2);
@@ -457,55 +342,6 @@ void TestOneThreadPrediction(
     PredictionWarmUp(predictor.get(), inputs, outputs, 1, 0, data_type);
   }
   PredictionRun(predictor.get(), inputs, outputs, 1, 0, data_type);
-}
-
-void TestMultiThreadPrediction(
-    const PaddlePredictor::Config *config,
-    const std::vector<std::vector<PaddleTensor>> &inputs,
-    std::vector<std::vector<PaddleTensor>> *outputs, int num_threads,
-    bool use_analysis = true) {
-  std::vector<std::thread> threads;
-  std::vector<std::unique_ptr<PaddlePredictor>> predictors;
-  predictors.emplace_back(CreateTestPredictor(config, use_analysis));
-  for (int tid = 1; tid < num_threads; tid++) {
-    predictors.emplace_back(predictors.front()->Clone());
-  }
-
-  for (int tid = 0; tid < num_threads; ++tid) {
-    threads.emplace_back([&, tid]() {
-      // Each thread should have local inputs and outputs.
-      // The inputs of each thread are all the same.
-      std::vector<std::vector<PaddleTensor>> outputs_tid;
-      auto &predictor = predictors[tid];
-#ifdef PADDLE_WITH_MKLDNN
-      if (use_analysis) {
-        static_cast<AnalysisPredictor *>(predictor.get())
-            ->SetMkldnnThreadID(static_cast<int>(tid) + 1);
-      }
-#endif
-      if (FLAGS_warmup) {
-        PredictionWarmUp(predictor.get(), inputs, &outputs_tid, num_threads,
-                         tid);
-      }
-      PredictionRun(predictor.get(), inputs, &outputs_tid, num_threads, tid);
-    });
-  }
-  for (int i = 0; i < num_threads; ++i) {
-    threads[i].join();
-  }
-}
-
-void TestPrediction(const PaddlePredictor::Config *config,
-                    const std::vector<std::vector<PaddleTensor>> &inputs,
-                    std::vector<std::vector<PaddleTensor>> *outputs,
-                    int num_threads, bool use_analysis = FLAGS_use_analysis) {
-  PrintConfig(config, use_analysis);
-  if (num_threads == 1) {
-    TestOneThreadPrediction(config, inputs, outputs, use_analysis);
-  } else {
-    TestMultiThreadPrediction(config, inputs, outputs, num_threads,
-                              use_analysis);
-  }
 }
 
 void CompareTopAccuracy(
@@ -545,37 +381,6 @@ void CompareTopAccuracy(
   CHECK_LE(std::abs(avg_acc1_quant - avg_acc1_ref), FLAGS_quantized_accuracy);
 }
 
-void CompareDeterministic(
-    const PaddlePredictor::Config *config,
-    const std::vector<std::vector<PaddleTensor>> &inputs) {
-  int batch_size = FLAGS_batch_size;
-  int num_times = FLAGS_repeat;
-  auto predictor = CreateTestPredictor(config, FLAGS_use_analysis);
-
-  std::vector<PaddleTensor> warmup_outputs, outputs;
-  // run num_times to Compare Deterministic Result.
-  for (size_t j = 0; j < inputs.size(); j++) {
-    // warmup run
-    predictor->Run(inputs[j], &warmup_outputs, batch_size);
-    for (int i = 0; i < num_times; i++) {
-      predictor->Run(inputs[j], &outputs, batch_size);
-      CompareResult(outputs, warmup_outputs);
-    }
-  }
-}
-
-void CompareNativeAndAnalysis(
-    const PaddlePredictor::Config *config,
-    const std::vector<std::vector<PaddleTensor>> &inputs) {
-  PrintConfig(config, true);
-  std::vector<std::vector<PaddleTensor>> native_outputs, analysis_outputs;
-  TestOneThreadPrediction(config, inputs, &native_outputs, false);
-  TestOneThreadPrediction(config, inputs, &analysis_outputs, true);
-  PADDLE_ENFORCE(native_outputs.size() > 0, "Native output is empty.");
-  PADDLE_ENFORCE(analysis_outputs.size() > 0, "Analysis output is empty.");
-  CompareResult(analysis_outputs.back(), native_outputs.back());
-}
-
 void CompareQuantizedAndAnalysis(
     const AnalysisConfig *config, const AnalysisConfig *qconfig,
     const std::vector<std::vector<PaddleTensor>> &inputs) {
@@ -599,170 +404,6 @@ void CompareQuantizedAndAnalysis(
     TestOneThreadPrediction(cfg, inputs, &analysis_outputs, true,
                             VarType::FP32);
   }
-}
-
-void CompareNativeAndAnalysis(
-    PaddlePredictor *native_pred, PaddlePredictor *analysis_pred,
-    const std::vector<std::vector<PaddleTensor>> &inputs) {
-  int batch_size = FLAGS_batch_size;
-  std::vector<PaddleTensor> native_outputs, analysis_outputs;
-  native_pred->Run(inputs[0], &native_outputs, batch_size);
-  analysis_pred->Run(inputs[0], &analysis_outputs, batch_size);
-  CompareResult(analysis_outputs, native_outputs);
-}
-
-void CompareAnalysisAndZeroCopy(
-    PaddlePredictor::Config *config, PaddlePredictor::Config *config1,
-    const std::vector<std::vector<PaddleTensor>> &inputs,
-    const std::vector<std::string> &outputs_name) {
-  int batch_size = FLAGS_batch_size;
-  // analysis
-  std::vector<PaddleTensor> analysis_outputs;
-  auto predictor = CreateTestPredictor(config, true);
-  predictor->Run(inputs[0], &analysis_outputs, batch_size);
-  // analysis + zero_copy
-  std::vector<ZeroCopyTensor> zerocopy_outputs;
-  reinterpret_cast<AnalysisConfig *>(config1)->SwitchUseFeedFetchOps(false);
-  predictor = CreateTestPredictor(config1, true);
-  ConvertPaddleTensorToZeroCopyTensor(predictor.get(), inputs[0]);
-  predictor->ZeroCopyRun();
-  for (size_t i = 0; i < outputs_name.size(); i++) {
-    ZeroCopyTensor zerocopy_output =
-        *predictor->GetOutputTensor(outputs_name[i]).get();
-    zerocopy_outputs.emplace_back(zerocopy_output);
-    LOG(INFO) << "ZeroCopy output: " << DescribeZeroCopyTensor(zerocopy_output);
-  }
-  // compare
-  CompareResult(analysis_outputs, zerocopy_outputs);
-}
-
-void SaveOptimModel(AnalysisConfig *cfg, const std::string &dstPath) {
-  auto predictor = CreateTestPredictor(
-      reinterpret_cast<const PaddlePredictor::Config *>(cfg),
-      FLAGS_use_analysis);
-  (static_cast<AnalysisPredictor *>(predictor.get()))->SaveOptimModel(dstPath);
-}
-
-template <typename T>
-std::string LoDTensorSummary(const framework::LoDTensor &tensor) {
-  std::stringstream ss;
-  ss << "\n---- tensor ---" << '\n';
-  ss << "lod: [";
-  for (const auto &level : tensor.lod()) {
-    ss << "[ ";
-    for (auto i : level) {
-      ss << i << ", ";
-    }
-    ss << "]";
-  }
-  ss << "]\n";
-
-  ss << "shape: [";
-  int size = 1;
-  for (int i = 0; i < tensor.dims().size(); i++) {
-    int dim = tensor.dims()[i];
-    ss << dim << ", ";
-    size *= dim;
-  }
-  ss << "]\n";
-
-  ss << "data: ";
-  for (int i = 0; i < std::min(20, size); i++) {
-    ss << tensor.data<T>()[i] << " ";
-  }
-  ss << "\n";
-
-  return ss.str();
-}
-
-static bool CompareLoD(const framework::LoD &a, const framework::LoD &b) {
-  if (a.size() != b.size()) {
-    LOG(ERROR) << string::Sprintf("lod size not match %d != %d", a.size(),
-                                  b.size());
-    return false;
-  }
-  for (size_t i = 0; i < a.size(); i++) {
-    auto &al = a[i];
-    auto &bl = b[i];
-    if (al.size() != bl.size()) {
-      LOG(ERROR) << string::Sprintf("level size %d != %d", al.size(),
-                                    bl.size());
-      return false;
-    }
-  }
-  return true;
-}
-
-static bool CompareShape(const std::vector<int64_t> &a,
-                         const std::vector<int64_t> &b) {
-  if (a.size() != b.size()) {
-    LOG(ERROR) << string::Sprintf("shape size not match %d != %d", a.size(),
-                                  b.size());
-    return false;
-  }
-  for (size_t i = 0; i < a.size(); i++) {
-    if (a[i] != b[i]) {
-      LOG(ERROR) << string::Sprintf("shape %d-th element not match %d != %d", i,
-                                    a[i], b[i]);
-      return false;
-    }
-  }
-  return true;
-}
-
-static bool CompareTensorData(const framework::LoDTensor &a,
-                              const framework::LoDTensor &b) {
-  auto a_shape = framework::vectorize(a.dims());
-  auto b_shape = framework::vectorize(b.dims());
-  size_t a_size = std::accumulate(a_shape.begin(), a_shape.end(), size_t{1},
-                                  [](int a, int b) { return a * b; });
-  size_t b_size = std::accumulate(b_shape.begin(), b_shape.end(), size_t{1},
-                                  [](int a, int b) { return a * b; });
-  if (a_size != b_size) {
-    LOG(ERROR) << string::Sprintf("tensor data size not match, %d != %d",
-                                  a_size, b_size);
-  }
-
-  for (size_t i = 0; i < a_size; i++) {
-    if (a.type() == VarType::FP32) {
-      const auto *a_data = a.data<float>();
-      const auto *b_data = b.data<float>();
-      if (std::abs(a_data[i] - b_data[i]) > 1e-3) {
-        LOG(ERROR) << string::Sprintf(
-            "tensor data %d-th element not match, %f != %f", i, a_data[i],
-            b_data[i]);
-        return false;
-      }
-    } else if (a.type() == VarType::INT64) {
-      const auto *a_data = a.data<int64_t>();
-      const auto *b_data = b.data<int64_t>();
-      if (std::abs(a_data[i] - b_data[i]) > 1e-3) {
-        LOG(ERROR) << string::Sprintf(
-            "tensor data %d-th element not match, %f != %f", i, a_data[i],
-            b_data[i]);
-        return false;
-      }
-    }
-  }
-
-  return true;
-}
-
-static bool CompareTensor(const framework::LoDTensor &a,
-                          const framework::LoDTensor &b) {
-  if (!CompareLoD(a.lod(), b.lod())) {
-    return false;
-  }
-  if (!CompareShape(framework::vectorize(a.dims()),
-                    framework::vectorize(b.dims()))) {
-    return false;
-  }
-
-  if (!CompareTensorData(a, b)) {
-    return false;
-  }
-
-  return true;
 }
 
 }  // namespace inference
