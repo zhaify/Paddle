@@ -71,6 +71,7 @@ DEFINE_string(image_data_path, "", "image_path");
 DEFINE_double(render_confidence, 0.2, "render confidence");
 DEFINE_string(images_list_path, "", "images list path");
 DEFINE_bool(draw_gt, false, "draw ground truth bounding box");
+DEFINE_int32(image_show_interval, 0, "duration between each image");
 
 DECLARE_bool(profile);
 DECLARE_int32(paddle_num_threads);
@@ -179,8 +180,6 @@ void PredictionRun(PaddlePredictor *predictor,
     i += 70;
   }
 
-  cv::Scalar gt_color = cv::Scalar(255, 255, 255);
-
   int TEXT_BACKGROUND_H = 20.0;
   for (int i = 0; i < iterations; i++) {
     LOG(INFO) << "reading image batch id " << i;
@@ -203,6 +202,25 @@ void PredictionRun(PaddlePredictor *predictor,
     run_timer.tic();
     predictor->Run(inputs[i], &output, FLAGS_batch_size);
     double elapsed_time = run_timer.toc();
+    // draw gt bbox
+    if (FLAGS_draw_gt) {
+      PaddleTensor gt_bboxes = inputs[i][1];
+      float num = static_cast<float>(std::accumulate(gt_bboxes.shape.begin(),
+                                                     gt_bboxes.shape.end(), 1,
+                                                     std::multiplies<int>()));
+      LOG(INFO) << "num of ground truth bbox " << num;
+      float *gt_bbs = static_cast<float *>(gt_bboxes.data.data());
+      for (int k = 0; k < static_cast<int>(num);) {
+        float x1 = std::min(std::max(gt_bbs[k++], 0.0f), 0.993f) * img2.cols;
+        float y1 = std::min(std::max(gt_bbs[k++], 0.0f), 0.993f) * img2.rows;
+        float x2 = std::min(std::max(gt_bbs[k++], 0.0f), 0.993f) * img2.cols;
+        float y2 = std::min(std::max(gt_bbs[k++], 0.0f), 0.993f) * img2.rows;
+        LOG(INFO) << "rendering ground truth bbox (" << x1 << ", " << y1
+                  << "), (" << x2 << ", " << y2 << ")";
+        cv::rectangle(img2, cv::Point(x1, y1), cv::Point(x2, y2),
+                      cv::Scalar(255, 255, 255), 2);
+      }
+    }
 
     PaddleTensor bboxes = output[0];
     PaddleTensor top1 = output[1];
@@ -212,7 +230,6 @@ void PredictionRun(PaddlePredictor *predictor,
         bboxes.shape.begin(), bboxes.shape.end(), 1, std::multiplies<int>()));
     LOG(INFO) << "num of prediction " << num;
     float *bbs = static_cast<float *>(bboxes.data.data());
-
     // draw predict bbox
     for (int k = 0; k < static_cast<int>(num);) {
       int label_index = static_cast<int>(bbs[k++]);
@@ -256,30 +273,6 @@ void PredictionRun(PaddlePredictor *predictor,
                                           text_size.height / 2)),
                       cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 0.5);
         }
-      }
-    }
-
-    // draw gt bbox
-    if (FLAGS_draw_gt) {
-      PaddleTensor gt_labels = inputs[i][2];
-      float num = static_cast<float>(std::accumulate(gt_labels.shape.begin(),
-                                                     gt_labels.shape.end(), 1,
-                                                     std::multiplies<int>()));
-      PaddleTensor gt_bboxes = inputs[i][1];
-      int l = 0;
-      float *gt_bbs = static_cast<float *>(gt_bboxes.data.data());
-      for (int k = 0; i < static_cast<int>(num); k++) {
-        float x1 = std::min(std::max(gt_bbs[k++], 0.0f), 0.993f) * img2.cols;
-        float y1 = std::min(std::max(gt_bbs[k++], 0.0f), 0.993f) * img2.rows;
-        float x2 = std::min(std::max(gt_bbs[k++], 0.0f), 0.993f) * img2.cols;
-        float y2 = std::min(std::max(gt_bbs[k++], 0.0f), 0.993f) * img2.rows;
-        LOG(INFO) << "rendering ground truth bbox (" << x1 << ", " << y1
-                  << "), (" << x2 << ", " << y2 << ")";
-
-        int label_index =
-            static_cast<int>(static_cast<float *>(gt_labels.data.data())[l]);
-        cv::rectangle(img2, cv::Point(x1, y1), cv::Point(x2, y2), gt_color, 2);
-        l += 1;
       }
     }
 
@@ -328,7 +321,7 @@ void PredictionRun(PaddlePredictor *predictor,
     }
 
     cv::imshow(FLAGS_title, img2);
-    cv::waitKey(0);
+    cv::waitKey(FLAGS_image_show_interval);
   }
 }
 
