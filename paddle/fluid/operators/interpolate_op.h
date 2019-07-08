@@ -11,6 +11,7 @@
 
 #pragma once
 #include <string>
+#include <vector>
 #include "paddle/fluid/framework/op_registry.h"
 #include "paddle/fluid/operators/math/math_function.h"
 
@@ -70,60 +71,47 @@ static void BilinearInterpolation(const Tensor& input, Tensor* output,
                                   const int c, const int out_h, const int out_w,
                                   const bool align_corners,
                                   const bool align_mode) {
-  // int times = 10000;
-  // LOG(INFO) << ">>>>>>>>>>>>>>>>>>>>>>>> run bilinear " << times << " times";
-  // LOG(INFO) << "times " << times << ", (" << n << ", " << c << ", " << out_h
-  //           << ", " << out_w << ")";
-  // LOG(INFO) << "in_h "
-  //           << ", (" << n << ", " << c << ", " << in_h << ", " << in_w <<
-  //           ")";
-  Timer run_timer;
   auto input_t = EigenTensor<T, 4>::From(input);
   auto output_t = EigenTensor<T, 4>::From(*output);
   bool align_flag = (align_mode == 0 && !align_corners);
+
   // double elapsed_time = 0.0;
   // run_timer.tic();
 
-  // for (int z = 0; z < times; z++) {
-  //   for (int k = 0; k < out_h; k++) {  // loop for images 16
-  //     int y_n = align_flag ? static_cast<int>(ratio_h * (k + 0.5) - 0.5)
-  //                          : static_cast<int>(ratio_h * k);
-  //     y_n = (y_n > 0) ? y_n : 0;
-  //     int y_s = (y_n + 1) < (in_h - 1) ? (y_n + 1) : (in_h - 1);
-  //     float d_n =
-  //         align_flag ? ratio_h * (k + 0.5) - 0.5 - y_n : ratio_h * k - y_n;
-  //     float d_s = 1.f - d_n;
+  // for (int k = 0; k < out_h; k++) {  // loop for images 16
+  //   int y_n = align_flag ? static_cast<int>(ratio_h * (k + 0.5) - 0.5)
+  //                         : static_cast<int>(ratio_h * k);
+  //   y_n = (y_n > 0) ? y_n : 0;
+  //   int y_s = (y_n + 1) < (in_h - 1) ? (y_n + 1) : (in_h - 1);
+  //   float d_n =
+  //       align_flag ? ratio_h * (k + 0.5) - 0.5 - y_n : ratio_h * k - y_n;
+  //   float d_s = 1.f - d_n;
 
-  //     for (int l = 0; l < out_w; l++) {  // 16
-  //       int x_w = (align_mode == 0 && !align_corners)
-  //                     ? static_cast<int>(ratio_w * (l + 0.5) - 0.5)
-  //                     : static_cast<int>(ratio_w * l);
-  //       x_w = (x_w > 0) ? x_w : 0;
-  //       int x_e = (x_w + 1) < (in_w - 1) ? (x_w + 1) : (in_w - 1);
-  //       float d_w =
-  //           align_flag ? ratio_w * (l + 0.5) - 0.5 - x_w : ratio_w * l - x_w;
-  //       float d_e = 1.f - d_w;
+  //   for (int l = 0; l < out_w; l++) {  // 16
+  //     int x_w = (align_mode == 0 && !align_corners)
+  //                   ? static_cast<int>(ratio_w * (l + 0.5) - 0.5)
+  //                   : static_cast<int>(ratio_w * l);
+  //     x_w = (x_w > 0) ? x_w : 0;
+  //     int x_e = (x_w + 1) < (in_w - 1) ? (x_w + 1) : (in_w - 1);
+  //     float d_w =
+  //         align_flag ? ratio_w * (l + 0.5) - 0.5 - x_w : ratio_w * l - x_w;
+  //     float d_e = 1.f - d_w;
+  //     #pragma omp parallel for collapse(2)
+  //     for (int i = 0; i < n; i++) {    // loop for batches 1
+  //       for (int j = 0; j < c; j++) {  // loop for channels 128
+  //         // bilinear interpolation
 
-  //       for (int i = 0; i < n; i++) {    // loop for batches 1
-  //         for (int j = 0; j < c; j++) {  // loop for channels 128
-  //           // bilinear interpolation
-  //           output_t(i, j, k, l) = input_t(i, j, y_n, x_w) * d_s * d_e +
-  //                                  input_t(i, j, y_s, x_w) * d_n * d_e +
-  //                                  input_t(i, j, y_n, x_e) * d_s * d_w +
-  //                                  input_t(i, j, y_s, x_e) * d_n * d_w;
-  //         }
+  //         output_t(i, j, k, l) = input_t(i, j, y_n, x_w) * d_s * d_e +
+  //                                 input_t(i, j, y_n, x_e) * d_s * d_w +
+  //                                 input_t(i, j, y_s, x_w) * d_n * d_e +
+  //                                 input_t(i, j, y_s, x_e) * d_n * d_w;
   //       }
   //     }
   //   }
   // }
-  // double elapsed_time = run_timer.toc();
-  // LOG(INFO) << "run origianal bilinear " << times << " times cost "
-  //           << elapsed_time << " avg " << elapsed_time / times;
 
-  // run_timer.tic();
-  // for (int z = 0; z < times; z++) {
-  int* src_index = new int[4 * out_h * out_w];
-  float* src_index_w = new float[4 * out_h * out_w];
+  std::vector<int> src_index;
+  std::vector<float> src_index_w;
 
   for (int k = 0; k < out_h; k++) {
     int y_n = align_flag ? static_cast<int>(ratio_h * (k + 0.5) - 0.5)
@@ -137,6 +125,10 @@ static void BilinearInterpolation(const Tensor& input, Tensor* output,
         align_flag ? ratio_h * (k + 0.5) - 0.5 - y_n : ratio_h * k - y_n;
     float d_s = 1.f - d_n;
     for (int l = 0; l < out_w; l++) {  // 16
+      src_index.emplace_back(y_n);
+
+      src_index.emplace_back(y_s);
+
       int x_w = (align_mode == 0 && !align_corners)
                     ? static_cast<int>(ratio_w * (l + 0.5) - 0.5)
                     : static_cast<int>(ratio_w * l);
@@ -144,25 +136,20 @@ static void BilinearInterpolation(const Tensor& input, Tensor* output,
       if (x_w < 0) {
         x_w = 0;
       }
+      src_index.emplace_back(x_w);
+
       int x_e = (x_w + 1) < (in_w - 1) ? (x_w + 1) : (in_w - 1);
+      src_index.emplace_back(x_e);
+
       float d_w =
           align_flag ? ratio_w * (l + 0.5) - 0.5 - x_w : ratio_w * l - x_w;
+      src_index_w.emplace_back(d_w);
+
       float d_e = 1.f - d_w;
-      int offset = k * out_h + l;
-      src_index[offset] = y_n;
-      src_index_w[offset] = d_s;
+      src_index_w.emplace_back(d_e);
 
-      offset++;
-      src_index[offset] = y_s;
-      src_index_w[offset] = d_e;
-
-      offset++;
-      src_index[offset] = x_w;
-      src_index_w[offset] = d_n;
-
-      offset++;
-      src_index[offset] = x_e;
-      src_index_w[offset] = d_w;
+      src_index_w.emplace_back(d_s);
+      src_index_w.emplace_back(d_n);
     }
   }
 
@@ -171,28 +158,28 @@ static void BilinearInterpolation(const Tensor& input, Tensor* output,
     for (int j = 0; j < c; j++) {          // loop for channels 128
       for (int k = 0; k < out_h; k++) {    // loop for images 16
         for (int l = 0; l < out_w; l++) {  // 16
+          // output_t(i, j, k, l) =  (input_t(i, j, y_n, x_e) * d_w + input_t(i,
+          // j, y_n, x_w) * d_e) * d_s +
+          //                         (input_t(i, j, y_s, x_e) * d_w + input_t(i,
+          //                         j, y_s, x_w) * d_e) * d_n;
           int offset = k * out_h + l;
+
           output_t(i, j, k, l) =
-              (input_t(i, j, src_index[offset], src_index[offset + 2]) *
-                   src_index_w[offset] +
-               input_t(i, j, src_index[offset + 1], src_index[offset + 2]) *
-                   src_index_w[offset + 2]) *
-                  src_index_w[offset + 1] +
               (input_t(i, j, src_index[offset], src_index[offset + 3]) *
                    src_index_w[offset] +
-               input_t(i, j, src_index[offset + 1], src_index[offset + 3]) *
-                   src_index_w[offset + 2]) *
+               input_t(i, j, src_index[offset], src_index[offset + 2]) *
+                   src_index_w[offset + 1]) *
+                  src_index_w[offset + 2] +
+
+              (input_t(i, j, src_index[offset + 1], src_index[offset + 3]) *
+                   src_index_w[offset] +
+               input_t(i, j, src_index[offset + 1], src_index[offset + 2]) *
+                   src_index_w[offset + 1]) *
                   src_index_w[offset + 3];
         }
       }
     }
   }
-  delete src_index;
-  delete src_index_w;
-  // }
-  // elapsed_time = run_timer.toc();
-  // LOG(INFO) << "run n c first bilinear " << times << " times cost "
-  //           << elapsed_time << " avg " << elapsed_time / times;
 }
 
 template <typename T>
